@@ -62,6 +62,15 @@ varimat_qc_tool/
 └── README.md
 ```
 
+## Troubleshooting: `502` or `AxiosError` on file upload
+
+If **browser upload** fails (often **502 Bad Gateway** or **AxiosError**) for **large VariMAT files** (e.g. 1GB+):
+
+- The app already allows **10GB** per file in `.streamlit/config.toml` and the **Dockerfile**.
+- The failure is usually the **host’s reverse proxy** (e.g. **Railway**, nginx) **timing out** or limiting long requests — not Streamlit’s size cap.
+- **Fix:** use **☁️ S3 (bucket)** or **📁 Local paths (server disk)** in the dashboard so data is not uploaded through the browser session.
+- For Railway, also ensure env vars from `.env.example` (`S3_BUCKET`, AWS keys) if using S3.
+
 ## Deployment options
 
 - **Internal server**: Run `streamlit run app.py` on a shared machine and share the URL (use `--server.port` and `--server.address` as needed).

@@ -710,6 +710,11 @@ def main():
 
     elif load_method == _METHOD_UPLOAD:
         st.caption("Upload from your computer (browser). For large files on the same machine as the server, use **Local paths** instead.")
+        st.warning(
+            "**Large files (hundreds of MB or more):** browser upload often fails on hosted apps with **502 / network errors** "
+            "because the platform proxy times out before the upload finishes. "
+            "Use **☁️ S3** or **📁 Local paths** on the server instead — they do not send the whole file through the browser."
+        )
         uploaded = st.file_uploader(
             "Browse or drag & drop VariMAT files",
             type=["txt", "tsv", "gz"],
