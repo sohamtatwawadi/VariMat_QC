@@ -1,0 +1,9 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+# Use polars-lts-cpu on Apple Silicon + Rosetta, older CPUs, or VMs without AVX — avoids segfaults from the default polars wheel.
+polars-lts-cpu>=0.20.0
+numpy>=1.24.0
+plotly>=5.18.0
+reportlab>=4.0.0
+pyarrow>=14.0.0
+boto3>=1.34.0

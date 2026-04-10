@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+.ipynb_checkpoints/
+qc_output/
+*.varimatqc.parquet
+.DS_Store
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/

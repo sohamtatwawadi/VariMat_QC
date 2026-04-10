@@ -1,0 +1,14 @@
+[server]
+# Allow VariMAT file uploads up to 10 GB per file
+maxUploadSize = 10240
+# Fix 403 on file upload when running locally (XSRF can block uploads on localhost)
+enableXsrfProtection = false
+
+[theme]
+# Modern light theme — professional UI
+base = "light"
+primaryColor = "#0f766e"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f8fafc"
+textColor = "#1e293b"
+font = "sans serif"
