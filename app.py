@@ -614,7 +614,7 @@ def main():
         _METHOD_UPLOAD: "📤 Local file upload & browse",
         _METHOD_PATHS: "📁 Local paths (server disk)",
     }
-    _method_options = ([_METHOD_S3] if s3_cfg else []) + [_METHOD_UPLOAD, _METHOD_PATHS]
+    _method_options = [_METHOD_S3, _METHOD_UPLOAD, _METHOD_PATHS]
 
     load_method = st.radio(
         "Choose how to load files",
@@ -628,78 +628,85 @@ def main():
     use_paths = False
     uploaded = None
 
-    if load_method == _METHOD_S3 and s3_cfg:
-        st.caption(f"S3 bucket: `{s3_cfg['bucket']}` · prefix: `{s3_cfg['prefix'] or '/'}`")
+    if load_method == _METHOD_S3:
+        if not s3_cfg:
+            st.warning(
+                "**S3 is not configured.** Set **`S3_BUCKET`** and AWS credentials as environment variables "
+                "or in **`.streamlit/secrets.toml`**. See **`.env.example`** in this repo. "
+                "Restart Streamlit after changing them."
+            )
+        else:
+            st.caption(f"S3 bucket: `{s3_cfg['bucket']}` · prefix: `{s3_cfg['prefix'] or '/'}`")
 
-        if st.button("🔄 Refresh file list", key="s3_refresh"):
-            st.session_state.pop("s3_file_list", None)
+            if st.button("🔄 Refresh file list", key="s3_refresh"):
+                st.session_state.pop("s3_file_list", None)
 
-        if "s3_file_list" not in st.session_state:
-            with st.spinner("Listing S3 files…"):
-                st.session_state["s3_file_list"] = list_s3_files(
-                    s3_cfg["bucket"], s3_cfg["prefix"]
+            if "s3_file_list" not in st.session_state:
+                with st.spinner("Listing S3 files…"):
+                    st.session_state["s3_file_list"] = list_s3_files(
+                        s3_cfg["bucket"], s3_cfg["prefix"]
+                    )
+
+            s3_files = st.session_state.get("s3_file_list", [])
+            err = st.session_state.pop("s3_list_error", None)
+            if err:
+                st.error(f"S3 listing failed: {err}")
+
+            if not s3_files:
+                st.info("No .txt / .tsv / .gz files found in the configured bucket/prefix.")
+            else:
+                file_df = pd.DataFrame(s3_files)[["key", "size_mb", "last_modified"]]
+                file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
+                st.dataframe(file_df, use_container_width=True, hide_index=True)
+
+                options = [f["key"] for f in s3_files]
+                selected_keys = st.multiselect(
+                    "Select 2–10 files to compare",
+                    options=options,
+                    key="s3_selected_keys",
+                    help="Files download to the server (/tmp) — no browser upload. Choose at most 10.",
                 )
 
-        s3_files = st.session_state.get("s3_file_list", [])
-        err = st.session_state.pop("s3_list_error", None)
-        if err:
-            st.error(f"S3 listing failed: {err}")
+                use_s3 = st.button(
+                    "Load selected files from S3",
+                    type="primary",
+                    key="s3_load_btn",
+                    disabled=len(selected_keys) < 2,
+                )
 
-        if not s3_files:
-            st.info("No .txt / .tsv / .gz files found in the configured bucket/prefix.")
-        else:
-            file_df = pd.DataFrame(s3_files)[["key", "size_mb", "last_modified"]]
-            file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
-            st.dataframe(file_df, use_container_width=True, hide_index=True)
-
-            options = [f["key"] for f in s3_files]
-            selected_keys = st.multiselect(
-                "Select 2–10 files to compare",
-                options=options,
-                key="s3_selected_keys",
-                help="Files download to the server (/tmp) — no browser upload. Choose at most 10.",
-            )
-
-            use_s3 = st.button(
-                "Load selected files from S3",
-                type="primary",
-                key="s3_load_btn",
-                disabled=len(selected_keys) < 2,
-            )
-
-            if use_s3 and len(selected_keys) >= 2:
-                selected_keys = selected_keys[:10]
-                s3_local_paths = []
-                dl_errors = []
-                dl_progress = st.progress(0)
-                dl_status = st.empty()
-                for i, key in enumerate(selected_keys):
-                    fname = key.split("/")[-1]
-                    dl_status.text(f"Downloading {fname} ({i + 1}/{len(selected_keys)})…")
-                    file_bar = st.progress(0)
+                if use_s3 and len(selected_keys) >= 2:
+                    selected_keys = selected_keys[:10]
+                    s3_local_paths = []
+                    dl_errors = []
+                    dl_progress = st.progress(0)
+                    dl_status = st.empty()
+                    for i, key in enumerate(selected_keys):
+                        fname = key.split("/")[-1]
+                        dl_status.text(f"Downloading {fname} ({i + 1}/{len(selected_keys)})…")
+                        file_bar = st.progress(0)
+                        try:
+                            local_path = download_s3_file(
+                                s3_cfg["bucket"], key, file_progress=file_bar
+                            )
+                            s3_local_paths.append(local_path)
+                        except Exception as e:
+                            dl_errors.append(f"{fname}: {e}")
+                        dl_progress.progress((i + 1) / len(selected_keys))
                     try:
-                        local_path = download_s3_file(
-                            s3_cfg["bucket"], key, file_progress=file_bar
-                        )
-                        s3_local_paths.append(local_path)
-                    except Exception as e:
-                        dl_errors.append(f"{fname}: {e}")
-                    dl_progress.progress((i + 1) / len(selected_keys))
-                try:
-                    dl_progress.empty()
-                except Exception:
-                    pass
-                try:
-                    dl_status.empty()
-                except Exception:
-                    pass
+                        dl_progress.empty()
+                    except Exception:
+                        pass
+                    try:
+                        dl_status.empty()
+                    except Exception:
+                        pass
 
-                for msg in dl_errors:
-                    st.error(msg)
+                    for msg in dl_errors:
+                        st.error(msg)
 
-                if len(s3_local_paths) >= 2:
-                    st.session_state["s3_resolved_paths"] = s3_local_paths
-                    st.rerun()
+                    if len(s3_local_paths) >= 2:
+                        st.session_state["s3_resolved_paths"] = s3_local_paths
+                        st.rerun()
 
     elif load_method == _METHOD_UPLOAD:
         st.caption("Upload from your computer (browser). For large files on the same machine as the server, use **Local paths** instead.")
@@ -826,8 +833,9 @@ def main():
     elif load_method == _METHOD_PATHS:
         st.info("Enter **local server paths** (one per line) and click **Load from paths**.")
         return
-    elif load_method == _METHOD_S3 and s3_cfg:
-        st.info("Select files from the S3 list and click **Load selected files from S3**.")
+    elif load_method == _METHOD_S3:
+        if s3_cfg:
+            st.info("Select files from the S3 list and click **Load selected files from S3**.")
         return
     else:
         return
