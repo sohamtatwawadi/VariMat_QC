@@ -873,35 +873,54 @@ def main():
     seen_names = {}
     upload_order = []
     max_workers = min(len(uploaded), 4)
-    with st.spinner("Loading and parsing files in parallel…"):
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(load_one_file, (f, i)) for i, f in enumerate(uploaded)]
-            results = []
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except Exception as e:
-                    results.append((9999, "unknown", None, str(e), 0.0, 0))
-            results.sort(key=lambda x: int(x[0]) if x[0] is not None else 9999)
-            for _ord, name, df, err, size_mb, byte_size in results:
-                display_name = name or "unknown"
-                if name in seen_names:
-                    seen_names[name] += 1
-                    display_name = f"{name} ({seen_names[name]})"
-                else:
-                    seen_names[name] = 1
-                if err or df is None:
-                    errors.append((display_name, err or "Load failed"))
-                    file_info.append({"File": display_name, "Records": "—", "Status": "❌ Error", "Size (MB)": f"{size_mb:.2f}"})
-                else:
-                    dataframes[display_name] = df
-                    upload_order.append((name, int(byte_size), display_name, df))
-                    file_info.append({
-                        "File": display_name,
-                        "Records": f"{len(df):,}",
-                        "Status": "✅ OK",
-                        "Size (MB)": f"{size_mb:.2f}",
-                    })
+    n_uploaded = len(uploaded)
+    st.caption(
+        "**Upload vs parse:** The file picker shows each file while it is **sent from your browser**. "
+        "Streamlit does not expose a byte-level progress bar for that step. "
+        "The bar below tracks **server-side parsing** (read buffer + Polars) after each file arrives — "
+        "this is usually what you see stuck on deploy for large files."
+    )
+    parse_bar = st.progress(0)
+    parse_line = st.empty()
+    parse_line.markdown(f"**Server parse:** starting **0 / {n_uploaded}** files…")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(load_one_file, (f, i)) for i, f in enumerate(uploaded)]
+        results = []
+        for k, future in enumerate(as_completed(futures), start=1):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                results.append((9999, "unknown", None, str(e), 0.0, 0))
+            parse_bar.progress(min(k / n_uploaded, 1.0))
+            parse_line.markdown(f"**Server parse:** finished **{k} / {n_uploaded}** file(s)…")
+
+    try:
+        parse_bar.empty()
+        parse_line.empty()
+    except Exception:
+        pass
+
+    results.sort(key=lambda x: int(x[0]) if x[0] is not None else 9999)
+    for _ord, name, df, err, size_mb, byte_size in results:
+        display_name = name or "unknown"
+        if name in seen_names:
+            seen_names[name] += 1
+            display_name = f"{name} ({seen_names[name]})"
+        else:
+            seen_names[name] = 1
+        if err or df is None:
+            errors.append((display_name, err or "Load failed"))
+            file_info.append({"File": display_name, "Records": "—", "Status": "❌ Error", "Size (MB)": f"{size_mb:.2f}"})
+        else:
+            dataframes[display_name] = df
+            upload_order.append((name, int(byte_size), display_name, df))
+            file_info.append({
+                "File": display_name,
+                "Records": f"{len(df):,}",
+                "Status": "✅ OK",
+                "Size (MB)": f"{size_mb:.2f}",
+            })
 
     st.subheader("Upload status")
     if file_info:
@@ -923,7 +942,8 @@ def main():
             return
         file_signatures = tuple((n, b) for n, b, _, _ in upload_order)
         dataframes_list = tuple((dn, d) for _, _, dn, d in upload_order)
-        results = run_full_qc(file_signatures, _dataframes_list=dataframes_list)
+        with st.spinner("Running full QC (overlap, mismatches, score — large files can take several minutes)…"):
+            results = run_full_qc(file_signatures, _dataframes_list=dataframes_list)
     except Exception as e:
         st.error(f"QC failed: {e}")
         return
