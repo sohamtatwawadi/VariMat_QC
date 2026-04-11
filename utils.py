@@ -99,12 +99,17 @@ def load_varimat(
             decompressed = gzip.decompress(raw)
             pl_df = _polars_read_varimat_from_bytes(decompressed, nrows)
         else:
+            decompressed = None
             pl_df = _polars_read_varimat_from_bytes(raw, nrows)
+        pl_df = _strip_polars_column_names(pl_df)
+        df = _pl_to_pandas(pl_df)
+        del pl_df
+        if is_gz:
+            del decompressed
+        gc.collect()  # force free polars memory before returning
     except Exception as e:
         raise RuntimeError(f"Parse error: {e}") from e
 
-    pl_df = _strip_polars_column_names(pl_df)
-    df = _pl_to_pandas(pl_df)
     if df is None:
         return pd.DataFrame()
     return df
@@ -184,10 +189,10 @@ def safe_load_varimat_from_path(path: str, nrows: Optional[int] = None) -> tuple
                 df = _pl_to_pandas(pl_df)
                 if not df.empty and all(c in df.columns for c in REQUIRED_COLS):
                     del pl_df
-                    gc.collect()
+                    gc.collect()  # force free polars memory before returning
                     return df, None
                 del pl_df
-                gc.collect()
+                gc.collect()  # force free polars memory before continuing
         except Exception:
             pass
 
@@ -210,8 +215,10 @@ def safe_load_varimat_from_path(path: str, nrows: Optional[int] = None) -> tuple
 
     if nrows is None:
         try:
-            # Write cache after successful parse; ignore failures (read-only dirs, etc.).
             pl_df.write_parquet(cache_path, compression="snappy")
+            # Verify write succeeded
+            if os.path.isfile(cache_path):
+                pass  # cache hit next time — no reparse needed
         except Exception:
             pass
 

@@ -539,8 +539,15 @@ def run_full_qc(file_signatures, _dataframes_list):
         header_result = compare_headers(dataframes)
         overlap_data = variant_overlap_analysis(variant_keys)
         common_ids = unique_metrics.get("common_variant_ids", set())
+
+        # Free the large sets after extraction
+        import gc
+
         mismatch_result = column_mismatch_detection(dataframes, variant_keys, common_ids)
         consistency_result = variant_consistency_analysis(dataframes, variant_keys, common_ids)
+        del common_ids
+        gc.collect()
+
         missing_data = missing_data_analysis(dataframes)
     except Exception as e:
         return {"error": str(e)}
@@ -932,7 +939,7 @@ def main():
             errors = []
             seen_names = {}
             ordered_success = []
-            max_workers = min(len(local_paths), 2)
+            max_workers = 1  # sequential on Railway — prevents double memory peak
             progress_bar = st.progress(0)
             st.caption("Loading from disk (thread pool; Polars releases GIL during I/O)…")
             with st.spinner("Reading files from disk (no upload)…"):
