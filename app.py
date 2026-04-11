@@ -654,9 +654,12 @@ def main():
                 st.divider()
 
                 # MIXED-SOURCE — Section A: S3 folder + file picker (0–9 S3 objects)
-                st.markdown("#### Step 2 — Pick files from S3")
+                st.markdown("#### Step 2 — Pick files from S3 (optional)")
                 base_prefix = s3_cfg["prefix"] or ""
-                st.caption(f"Bucket: `{s3_cfg['bucket']}`  Prefix: `{base_prefix or '/'}`")
+                st.caption(
+                    f"Bucket: `{s3_cfg['bucket']}`  Prefix: `{base_prefix or '/'}` — "
+                    "skip this step if you already chose 2+ files in Step 1."
+                )
 
                 _, col_btn = st.columns([6, 1])
                 with col_btn:
@@ -677,7 +680,6 @@ def main():
 
                 folders = st.session_state.get("s3_folder_list", [])
                 chosen_display = base_prefix or "/"
-                s3_selected_keys: list[str] = []
 
                 if not folders:
                     st.info("No folders found — listing files directly under prefix.")
@@ -710,21 +712,31 @@ def main():
                 if not folders and not files_for_select:
                     st.warning("No files or folders found under the configured prefix.")
                 elif not files_for_select:
-                    st.info("No .txt / .tsv / .gz files in this folder.")
+                    st.info(
+                        "No .txt / .tsv / .gz files in this folder — use **Step 1** uploads only, "
+                        "or pick another run folder."
+                    )
                 else:
                     file_df = pd.DataFrame(files_for_select)[["key", "size_mb", "last_modified"]]
                     file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
                     st.dataframe(file_df, use_container_width=True, hide_index=True)
 
-                    s3_options = [f["key"] for f in files_for_select]
-                    s3_selected_keys = st.multiselect(
-                        "Select files from S3 (optional — can mix with uploaded files below)",
-                        options=s3_options,
-                        max_selections=9,
-                        key="s3_selected_keys",
-                        help="You can select 0 files here and use only browser upload, or mix both.",
-                    )
-                    s3_selected_keys = list(s3_selected_keys or [])[:9]
+                # Always render multiselect so widget key stays registered (upload-only runs still work).
+                s3_options = [f["key"] for f in files_for_select]
+                _s3_opts_display = (
+                    s3_options
+                    if s3_options
+                    else ["(No .txt / .tsv / .gz here — use Step 1 uploads or another folder)"]
+                )
+                _raw_s3_sel = st.multiselect(
+                    "Select files from S3 (optional — 0 needed if Step 1 has your files)",
+                    options=_s3_opts_display,
+                    max_selections=9 if s3_options else 1,
+                    key="s3_selected_keys",
+                    disabled=not bool(s3_options),
+                    help="Mix with Step 1: e.g. 2 uploads, or 1 S3 + 1 upload, or 2 from S3.",
+                )
+                s3_selected_keys = [k for k in (_raw_s3_sel or []) if k in s3_options][:9]
 
                 max_upload = max(1, 10 - (len(s3_selected_keys) if s3_selected_keys else 0))
                 um_list = list(uploaded_mixed or [])
@@ -737,7 +749,7 @@ def main():
                     um_list = um_list[:max_upload]
 
                 n_s3_btn = len(s3_selected_keys) if s3_selected_keys else 0
-                n_up_btn = len(uploaded_mixed) if uploaded_mixed else 0
+                n_up_btn = len(um_list)
                 total_btn = n_s3_btn + n_up_btn
                 if total_btn < 2:
                     st.info(
@@ -762,15 +774,18 @@ def main():
                 if um_list:
                     st.markdown("**From browser:**")
                     for f in um_list:
+                        # Do not call getvalue() here — it can disturb the buffer before save uses f.read().
                         nbytes = getattr(f, "size", None) or 0
-                        if not nbytes and hasattr(f, "getvalue"):
-                            nbytes = len(f.getvalue())
-                        size_mb = nbytes / (1024 * 1024)
-                        st.caption(f"  💻 {f.name}  ({size_mb:.0f} MB)")
+                        size_mb = (nbytes / (1024 * 1024)) if nbytes else 0.0
+                        st.caption(
+                            f"  💻 {f.name}  ({size_mb:.0f} MB)"
+                            if nbytes
+                            else f"  💻 {f.name}"
+                        )
 
-                # Re-evaluate counts immediately before the button so Streamlit has the latest uploader state
+                # Re-evaluate counts immediately before the button (um_list matches what we will save/load).
                 n_s3_btn = len(s3_selected_keys) if s3_selected_keys else 0
-                n_up_btn = len(uploaded_mixed) if uploaded_mixed else 0
+                n_up_btn = len(um_list)
                 total_btn = n_s3_btn + n_up_btn
 
                 load_btn = st.button(
