@@ -13,6 +13,28 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+    from streamlit import fragment as st_fragment
+except ImportError:
+
+    def st_fragment(f):
+        return f
+
+
+def _qc_local_paths_signature(paths):
+    """Canonical (order-independent) signature for on-disk paths for QC cache."""
+    rows = []
+    for p in paths:
+        if not p or not os.path.isfile(p):
+            continue
+        ap = os.path.abspath(os.path.expanduser(p.strip()))
+        try:
+            rows.append((ap, os.path.getmtime(ap), os.path.getsize(ap)))
+        except OSError:
+            continue
+    return tuple(sorted(rows, key=lambda x: x[0])) if len(rows) >= 2 else None
+
+
 from qc_engine import (
     compare_headers,
     compute_record_metrics,
@@ -262,6 +284,76 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
                     )
 
 
+@st_fragment
+def _render_download_buttons(
+    n_files,
+    total_records,
+    total_unique,
+    common_count,
+    qc_score,
+    qc_status,
+    header_result,
+    record_metrics,
+    overlap_data,
+    mismatch_result,
+    dup_analysis,
+    results,
+):
+    st.subheader("Download reports")
+    try:
+        qc_summary = {
+            "files_compared": n_files,
+            "total_records": total_records,
+            "unique_variants": total_unique,
+            "common_in_all": common_count,
+            "qc_score": qc_score,
+            "qc_status": qc_status,
+            "header_similarity_pct": header_result.get("header_similarity_pct", 0),
+        }
+        clin_state = st.session_state.get("clinical_concordance")
+        clin_mdf = None
+        if clin_state and not clin_state.get("error") and clin_state.get("mismatch_df") is not None:
+            m = clin_state["mismatch_df"]
+            if hasattr(m, "empty") and not m.empty:
+                clin_mdf = m
+        csv_exports = generate_csv_exports(
+            record_metrics,
+            overlap_data or {},
+            mismatch_result.get("mismatch_table"),
+            dup_analysis or {},
+            header_result.get("column_table"),
+            overlap_data.get("unique_per_file", {}),
+            overlap_data.get("missing_pairs", {}),
+            qc_summary=qc_summary,
+            clinical_mismatch_df=clin_mdf,
+        )
+        for fname, content in (csv_exports or {}).items():
+            st.download_button(f"Download {fname}", content, file_name=fname, mime="text/csv", key=f"csv_{fname}")
+        pdf_bytes = generate_pdf_report(
+            qc_score=qc_score,
+            qc_status=qc_status,
+            n_files=n_files,
+            total_records=total_records,
+            total_unique=total_unique,
+            common_count=common_count,
+            record_metrics=record_metrics,
+            header_similarity=header_result.get("header_similarity_pct", 0),
+            header_table=header_result.get("column_table"),
+            overlap_data=overlap_data or {},
+            mismatch_count=mismatch_result.get("mismatch_count", 0),
+            dup_analysis=dup_analysis or {},
+            management_summary={
+                "variant_consistency": "High" if qc_score >= 75 else "Medium" if qc_score >= 50 else "Low"
+            },
+            clinical_concordance=clin_state if clin_state else None,
+        )
+        st.download_button(
+            "Download PDF report", pdf_bytes, file_name=get_pdf_filename(), mime="application/pdf", key="pdf_dl"
+        )
+    except Exception as e:
+        st.error(f"Could not generate reports: {e}")
+
+
 def _render_qc_results(results: dict) -> None:
     """Unpack QC results and render KPIs, tabs, and download buttons."""
     if not results or not isinstance(results, dict):
@@ -275,6 +367,15 @@ def _render_qc_results(results: dict) -> None:
 
 def _render_qc_results_impl(results: dict) -> None:
     """Implementation of QC results rendering (called inside try/except)."""
+    col_title, col_clear = st.columns([8, 1])
+    with col_clear:
+        if st.button("🔄 Clear & reload", key="clear_cache_btn"):
+            for k in ["_qc_results", "_qc_file_signatures", "s3_resolved_paths", "clinical_concordance"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+    with col_title:
+        pass
+
     record_metrics = results.get("record_metrics")
     unique_metrics = results.get("unique_metrics") or {}
     dup_analysis = results.get("dup_analysis") or {}
@@ -476,36 +577,20 @@ def _render_qc_results_impl(results: dict) -> None:
                                 st.dataframe(sub.head(50), hide_index=True)
             except Exception:
                 pass
-        st.subheader("Download reports")
-        try:
-            qc_summary = {"files_compared": n_files, "total_records": total_records, "unique_variants": total_unique,
-                          "common_in_all": common_count, "qc_score": qc_score, "qc_status": qc_status,
-                          "header_similarity_pct": header_result.get("header_similarity_pct", 0)}
-            clin_state = st.session_state.get("clinical_concordance")
-            clin_mdf = None
-            if clin_state and not clin_state.get("error") and clin_state.get("mismatch_df") is not None:
-                m = clin_state["mismatch_df"]
-                if hasattr(m, "empty") and not m.empty:
-                    clin_mdf = m
-            csv_exports = generate_csv_exports(
-                record_metrics, overlap_data or {}, mismatch_result.get("mismatch_table"), dup_analysis or {},
-                header_result.get("column_table"), overlap_data.get("unique_per_file", {}), overlap_data.get("missing_pairs", {}),
-                qc_summary=qc_summary,
-                clinical_mismatch_df=clin_mdf,
-            )
-            for fname, content in (csv_exports or {}).items():
-                st.download_button(f"Download {fname}", content, file_name=fname, mime="text/csv", key=f"csv_{fname}")
-            pdf_bytes = generate_pdf_report(
-                qc_score=qc_score, qc_status=qc_status, n_files=n_files, total_records=total_records,
-                total_unique=total_unique, common_count=common_count, record_metrics=record_metrics,
-                header_similarity=header_result.get("header_similarity_pct", 0), header_table=header_result.get("column_table"),
-                overlap_data=overlap_data or {}, mismatch_count=mismatch_result.get("mismatch_count", 0), dup_analysis=dup_analysis or {},
-                management_summary={"variant_consistency": "High" if qc_score >= 75 else "Medium" if qc_score >= 50 else "Low"},
-                clinical_concordance=clin_state if clin_state else None,
-            )
-            st.download_button("Download PDF report", pdf_bytes, file_name=get_pdf_filename(), mime="application/pdf", key="pdf_dl")
-        except Exception as e:
-            st.error(f"Could not generate reports: {e}")
+        _render_download_buttons(
+            n_files,
+            total_records,
+            total_unique,
+            common_count,
+            qc_score,
+            qc_status,
+            header_result,
+            record_metrics,
+            overlap_data,
+            mismatch_result,
+            dup_analysis,
+            results,
+        )
 
     if dup_analysis:
         dup_counts = [d.get("n_duplicated_variants", 0) for d in dup_analysis.values()]
@@ -645,6 +730,8 @@ def main():
             "s3_last_prefix",
             "s3_selected_keys",
             "clinical_concordance",
+            "_qc_results",
+            "_qc_file_signatures",
         ]:
             st.session_state.pop(_k, None)
     st.session_state["_prev_load_method"] = load_method
@@ -933,6 +1020,28 @@ def main():
         if len(local_paths) < 2:
             st.warning("Enter at least 2 paths for comparison.")
         else:
+            # Check if these exact files were already parsed this session (canonical path order)
+            try:
+                _incoming_sig = _qc_local_paths_signature(local_paths)
+            except Exception:
+                _incoming_sig = None
+
+            if (
+                _incoming_sig
+                and st.session_state.get("_qc_file_signatures") == _incoming_sig
+                and st.session_state.get("_qc_results") is not None
+            ):
+                st.success("✅ Using cached results (files unchanged).")
+                results_qc = st.session_state["_qc_results"]
+                if results_qc is None:
+                    st.stop()
+                if results_qc.get("error"):
+                    st.error(results_qc["error"])
+                else:
+                    _render_qc_results(results_qc)
+                st.stop()
+
+            # else: fall through to normal parse + QC pipeline below
             file_info = []
             dataframes = {}
             errors = []
@@ -990,17 +1099,28 @@ def main():
                     if len(ordered_success) < 2:
                         st.error("Need at least 2 valid files to run QC.")
                     else:
-                        file_signatures = tuple(
-                            (p, os.path.getmtime(p), os.path.getsize(p)) for p, _, _ in ordered_success
-                        )
-                        dataframes_list = tuple((dn, d) for _, dn, d in ordered_success)
-                        results_qc = run_full_qc(file_signatures, _dataframes_list=dataframes_list)
-                        if results_qc is None:
-                            st.error("QC could not run (e.g. missing required columns).")
-                        elif results_qc.get("error"):
-                            st.error(results_qc["error"])
+                        # Store parsed dataframes in session_state so button clicks
+                        # don't re-trigger file parsing (which causes OOM on Railway)
+                        results_qc = None
+                        _sig = _qc_local_paths_signature([p for p, _, _ in ordered_success])
+                        if _sig is None:
+                            st.error("Could not build file signatures for QC cache.")
+                        elif st.session_state.get("_qc_file_signatures") != _sig:
+                            file_signatures = _sig
+                            dataframes_list = tuple((dn, d) for _, dn, d in ordered_success)
+                            results_qc = run_full_qc(file_signatures, _dataframes_list=dataframes_list)
+                            st.session_state["_qc_results"] = results_qc
+                            st.session_state["_qc_file_signatures"] = _sig
                         else:
-                            _render_qc_results(results_qc)
+                            results_qc = st.session_state.get("_qc_results")
+
+                        if _sig is not None:
+                            if results_qc is None:
+                                st.error("QC could not run (e.g. missing required columns).")
+                            elif results_qc.get("error"):
+                                st.error(results_qc["error"])
+                            else:
+                                _render_qc_results(results_qc)
                 except Exception as e:
                     st.error(f"QC step failed: {e}")
             else:
