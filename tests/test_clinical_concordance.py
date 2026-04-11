@@ -1,4 +1,4 @@
-"""Unit tests for clinical Cloud vs LinC concordance."""
+"""Unit tests for clinical Cloud vs On-Prem concordance."""
 
 import pandas as pd
 

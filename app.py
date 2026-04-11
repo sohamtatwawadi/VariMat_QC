@@ -46,7 +46,14 @@ from qc_engine import (
     variant_overlap_analysis,
     column_mismatch_detection,
 )
-from report_generator import generate_csv_exports, generate_pdf_report, get_pdf_filename
+from report_generator import (
+    generate_csv_exports,
+    generate_pdf_report,
+    get_pdf_filename,
+    generate_concordance_pdf_report,
+    generate_concordance_csv_exports,
+    get_concordance_pdf_filename,
+)
 from utils import create_variant_key, load_varimat_path_worker
 
 # Page config
@@ -145,7 +152,7 @@ def _genes_both_for_clinical(df_cloud: pd.DataFrame, df_linc: pd.DataFrame, gene
 
 
 def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
-    """Cloud vs LinC cell-level concordance; stores result in session_state for PDF."""
+    """Cloud vs On-Prem cell-level concordance; stores result in session_state for PDF."""
     from clinical_concordance import (
         detect_gene_column,
         default_strict_columns,
@@ -156,11 +163,11 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
         return
 
     names = list(dataframes.keys())
-    with st.expander("Executive validation — Cloud vs LinC", expanded=False):
+    with st.expander("Executive validation — Cloud vs On-Prem", expanded=False):
         st.markdown(
             '<p style="color:#64748b;font-size:0.9rem;">Transcript-level match: <code>CHROM</code>, <code>START</code>, '
             "<code>REF</code>, <code>ALT</code>, <code>ENS_TRANS_ID</code>. Optional on-target filter "
-            "(<code>VARIANT_LOCATION</code> = ONTARGET). Cloud is the numeric reference for tolerance. "
+            "(<code>VARIANT_LOCATION</code> = ONTARGET). Cloud is the numeric reference for tolerance. On-Prem is compared against Cloud. "
             "Comparisons are <b>vectorized</b> for speed; use <b>local paths</b> to avoid long upload times. "
             "For multi‑GB files, prefer <b>one gene</b> or <b>limit columns</b> so total runtime stays within a few minutes.</p>",
             unsafe_allow_html=True,
@@ -172,9 +179,9 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
         linc_candidates = [n for n in names if n != cloud_name]
         with c2:
             if not linc_candidates:
-                st.warning("Need at least two distinct files for Cloud vs LinC.")
+                st.warning("Need at least two distinct files for Cloud vs On-Prem.")
                 return
-            linc_name = st.selectbox("LinC file", linc_candidates, key="ev_linc_file")
+            linc_name = st.selectbox("On-Prem file", linc_candidates, key="ev_linc_file")
 
         df_c = dataframes[cloud_name]
         df_l = dataframes[linc_name]
@@ -199,7 +206,7 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
                 gene_col = gene_col_c
 
         restrict_ot = st.checkbox("Restrict to on-target only (VARIANT_LOCATION)", value=True, key="ev_ontarget")
-        tol = st.slider("Numeric tolerance (± %, LinC vs Cloud)", min_value=0.0, max_value=20.0, value=10.0, step=1.0, key="ev_tol")
+        tol = st.slider("Numeric tolerance (± %, On-Prem vs Cloud)", min_value=0.0, max_value=20.0, value=10.0, step=1.0, key="ev_tol")
 
         gene_sel = None
         if not compare_all:
@@ -225,7 +232,7 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
             help="Leave empty to compare every shared annotation column. Selecting a subset (e.g. 30–80 fields) keeps runs fast.",
         )
 
-        if st.button("Run Cloud vs LinC validation", type="primary", key="ev_run"):
+        if st.button("Run Cloud vs On-Prem validation", type="primary", key="ev_run"):
             with st.spinner("Running vectorized transcript-level concordance (may take 1–3 min on very large files)…"):
                 try:
                     res = run_pairwise_concordance(
@@ -235,7 +242,7 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
                         gene_col=gene_col,
                         compare_all_genes=compare_all,
                         label_cloud="Cloud",
-                        label_linc="LinC",
+                        label_linc="On-Prem",
                         strict_columns=strict_sel if strict_sel else None,
                         compare_columns=col_subset if col_subset else None,
                         tolerance_pct=float(tol),
@@ -267,9 +274,9 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
 
                 st.caption(
                     f"Rows after filters — Cloud: {res.get('n_rows_cloud_after_filters', 0):,} · "
-                    f"LinC: {res.get('n_rows_linc_after_filters', 0):,} · "
+                    f"On-Prem: {res.get('n_rows_linc_after_filters', 0):,} · "
                     f"Duplicates dropped — Cloud: {res.get('n_duplicate_rows_dropped_cloud', 0):,} · "
-                    f"LinC: {res.get('n_duplicate_rows_dropped_linc', 0):,}"
+                    f"On-Prem: {res.get('n_duplicate_rows_dropped_linc', 0):,}"
                 )
 
                 mdf = res.get("mismatch_df")
@@ -296,6 +303,62 @@ def _save_outputs_to_qc_output(csv_exports: dict, pdf_bytes: bytes, pdf_filename
     with open(os.path.join(_QC_OUTPUT_DIR, pdf_filename), "wb") as f:
         f.write(pdf_bytes)
     return _QC_OUTPUT_DIR
+
+
+@st_fragment
+def _render_concordance_downloads(clin_res: dict) -> None:
+    """Fragment-isolated concordance download buttons — clicking does not rerun the full app."""
+    st.subheader("📥 Download concordance reports")
+    st.caption("These reports cover Cloud vs On-Prem concordance only, "
+               "separate from the general QC report.")
+
+    conc_csvs = generate_concordance_csv_exports(clin_res)
+    dl1, dl2, dl3, dl4, dl5 = st.columns(5)
+    with dl1:
+        st.download_button(
+            "📄 Mismatches CSV",
+            conc_csvs.get("concordance_mismatches.csv", b""),
+            file_name="concordance_mismatches.csv",
+            mime="text/csv",
+            key="dl_conc_mismatches"
+        )
+    with dl2:
+        st.download_button(
+            "📄 Matches CSV",
+            conc_csvs.get("concordance_matches.csv", b""),
+            file_name="concordance_matches.csv",
+            mime="text/csv",
+            key="dl_conc_matches"
+        )
+    with dl3:
+        st.download_button(
+            "📄 Per-column CSV",
+            conc_csvs.get("concordance_per_column_summary.csv", b""),
+            file_name="concordance_per_column_summary.csv",
+            mime="text/csv",
+            key="dl_conc_col_summary"
+        )
+    with dl4:
+        st.download_button(
+            "📄 Summary CSV",
+            conc_csvs.get("concordance_summary.csv", b""),
+            file_name="concordance_summary.csv",
+            mime="text/csv",
+            key="dl_conc_summary"
+        )
+    with dl5:
+        conc_pdf = generate_concordance_pdf_report(
+            clin_res,
+            label_cloud="Cloud",
+            label_onprem="On-Prem"
+        )
+        st.download_button(
+            "📋 Full PDF Report",
+            conc_pdf,
+            file_name=get_concordance_pdf_filename(),
+            mime="application/pdf",
+            key="dl_conc_pdf"
+        )
 
 
 @st_fragment
@@ -461,43 +524,118 @@ def _render_qc_results_impl(results: dict) -> None:
         - **QC Score:** {qc_score}/100 ({qc_status})
         """)
 
-    # Auto-run clinical concordance (all genes) — display inline instead of manual expander
+    # CONCORDANCE — auto-run clinical concordance display
     clin_result = results.get("clinical_concordance")
     if clin_result and not clin_result.get("error") and clin_result.get("total_tests"):
         st.session_state["clinical_concordance"] = clin_result
-        with st.expander("Executive validation — Cloud vs LinC (all genes, automatic)", expanded=True):
-            m1, m2, m3, m4 = st.columns(4)
+        with st.expander("Executive validation — Cloud vs On-Prem (all genes, automatic)", expanded=True):
+            res = clin_result
+
+            # CONCORDANCE — Row 1: top-level KPIs
+            m1, m2, m3 = st.columns(3)
             with m1:
-                st.metric("Concordance %", f"{clin_result.get('concordance_pct', 0):.2f}")
+                st.metric("Overall Concordance", f"{res.get('concordance_pct', 0):.4f}%")
             with m2:
-                st.metric("Cell-level tests", f"{clin_result.get('total_tests', 0):,}")
+                st.metric("Perfectly Matched Rows",
+                          f"{res.get('n_perfect_match_rows', 0):,}",
+                          help="Rows where every compared column matched exactly")
             with m3:
-                st.metric("Strict mismatches", clin_result.get("n_failed_strict", 0))
+                st.metric("Rows with Mismatches",
+                          f"{res.get('n_mismatch_rows', 0):,}",
+                          help="Rows where at least one column differed")
+
+            m4, m5, m6 = st.columns(3)
             with m4:
-                st.metric("Matched rows", clin_result.get("n_rows_matched", 0))
-            st.caption(
-                f"Rows after filters — {list(dataframes.keys())[0] if dataframes else 'Cloud'}: "
-                f"{clin_result.get('n_rows_cloud_after_filters', 0):,} · "
-                f"{list(dataframes.keys())[1] if len(dataframes) > 1 else 'LinC'}: "
-                f"{clin_result.get('n_rows_linc_after_filters', 0):,} · "
-                f"Duplicates dropped: {clin_result.get('n_duplicate_rows_dropped_cloud', 0):,} / "
-                f"{clin_result.get('n_duplicate_rows_dropped_linc', 0):,}"
-            )
-            mdf = clin_result.get("mismatch_df")
-            if mdf is not None and not mdf.empty:
-                st.subheader("Mismatch detail (first 200 rows)")
-                st.dataframe(mdf.head(200), use_container_width=True, hide_index=True)
-            elif clin_result.get("n_failed", 0) == 0:
-                st.success("No cell-level mismatches in scope.")
-            if clin_result.get("mismatch_rows_truncated"):
-                st.warning("Mismatch table and CSV capped at 250,000 rows; total mismatch count in metrics is complete.")
-            for w in clin_result.get("warnings") or []:
+                st.metric("Strict Field Mismatches",
+                          res.get('n_failed_strict', 0),
+                          help="Clinical fields (CDNA_CHG, AA_CHG, HGVS) — zero tolerance")
+            with m5:
+                st.metric("Cell-level Tests", f"{res.get('total_tests', 0):,}")
+            with m6:
+                st.metric("Matched Rows (inner join)", f"{res.get('n_rows_matched', 0):,}")
+
+            # CONCORDANCE — Row 2: validation status banner
+            n_strict = res.get('n_failed_strict', 0)
+            concordance = res.get('concordance_pct', 0)
+            if n_strict == 0 and concordance >= 99.0:
+                st.markdown(
+                    '<div class="success-box">✅ <b>PASS</b> — No strict clinical field '
+                    'mismatches. Concordance ≥ 99%. Files are validated for upload.</div>',
+                    unsafe_allow_html=True
+                )
+            elif n_strict == 0 and concordance >= 95.0:
+                st.markdown(
+                    '<div class="warning-box">⚠️ <b>REVIEW</b> — No strict mismatches but '
+                    f'concordance is {concordance:.2f}%. Investigate non-strict mismatches '
+                    'before upload.</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    '<div class="warning-box">❌ <b>FAIL</b> — Strict clinical field '
+                    f'mismatches detected ({n_strict}). Do NOT upload until resolved.</div>',
+                    unsafe_allow_html=True
+                )
+
+            # CONCORDANCE — Row 3: per-column concordance table
+            col_pcts = res.get('col_concordance_pct', {})
+            col_counts = res.get('col_mismatch_counts', {})
+            if col_pcts:
+                col_df = pd.DataFrame([
+                    {
+                        "Column": col,
+                        "Concordance %": f"{pct:.2f}",
+                        "Mismatches": col_counts.get(col, 0),
+                        "Status": "✅" if pct == 100.0 else ("⚠️" if pct >= 95.0 else "❌")
+                    }
+                    for col, pct in sorted(col_pcts.items(), key=lambda x: x[1])
+                ])
+                st.subheader("Per-column concordance")
+                st.caption("Sorted by concordance ascending — worst columns first.")
+                st.dataframe(col_df, use_container_width=True, hide_index=True)
+
+            # CONCORDANCE — Row 4: strict field failures
+            strict_vars = res.get('strict_fail_variants', [])
+            if strict_vars:
+                st.subheader("⚠️ Variants with strict field failures")
+                st.caption("These variants have mismatches in CDNA_CHG / AA_CHG / HGVS "
+                           "— clinical report fields. Must be resolved before upload.")
+                st.dataframe(pd.DataFrame({"Variant Key": strict_vars}),
+                             use_container_width=True, hide_index=True)
+
+            # CONCORDANCE — Row 5: mismatch and match detail tables
+            tab_mm, tab_match = st.tabs(["❌ Mismatches", "✅ Matches"])
+            with tab_mm:
+                mdf = res.get("mismatch_df")
+                if mdf is not None and not mdf.empty:
+                    st.caption(f"Showing first 200 of {res.get('n_mismatch_rows', 0):,} "
+                               f"mismatch rows. Download full CSV below.")
+                    st.dataframe(mdf.head(200), use_container_width=True, hide_index=True)
+                else:
+                    st.success("No mismatches found.")
+            with tab_match:
+                match_df = res.get("match_df")
+                if match_df is not None and not match_df.empty:
+                    st.caption(f"{res.get('n_perfect_match_rows', 0):,} rows matched "
+                               f"perfectly across all {len(res.get('col_concordance_pct', {}))} "
+                               f"compared columns.")
+                    st.dataframe(match_df.head(200), use_container_width=True, hide_index=True)
+
+            # CONCORDANCE — Row 6: excluded columns note
+            excl = res.get('excluded_cols', [])
+            if excl:
+                st.caption(f"ℹ️ Excluded from comparison: {', '.join(excl)}")
+
+            for w in res.get("warnings") or []:
                 st.warning(w)
+
+            # CONCORDANCE — download buttons (fragment-isolated to prevent full rerun)
+            _render_concordance_downloads(res)
     elif clin_result and clin_result.get("error"):
-        with st.expander("Executive validation — Cloud vs LinC", expanded=False):
+        with st.expander("Executive validation — Cloud vs On-Prem", expanded=False):
             st.error(f"Clinical concordance: {clin_result['error']}")
     else:
-        with st.expander("Executive validation — Cloud vs LinC", expanded=False):
+        with st.expander("Executive validation — Cloud vs On-Prem", expanded=False):
             st.info("Clinical concordance was not run (requires 2 files with matching columns).")
 
     tab_overview, tab_variant, tab_dup, tab_header, tab_mismatch, tab_missing, tab_reports = st.tabs([
@@ -714,13 +852,15 @@ def run_full_qc(file_signatures, _dataframes_list):
             else:
                 gene_col = None  # no gene column needed for compare_all_genes=True
 
+            # CONCORDANCE — auto-run with explicit params
             clinical_concordance_result = run_pairwise_concordance(
                 df_cloud,
                 df_linc,
                 compare_all_genes=True,
-                label_cloud=names[0],
-                label_linc=names[1],
-                gene_col=gene_col,
+                label_cloud="Cloud",
+                label_linc="On-Prem",
+                strict_columns=None,
+                compare_columns=None,
                 tolerance_pct=10.0,
                 restrict_ontarget=True,
             )

@@ -1,5 +1,5 @@
 """
-Cloud vs LinC executive validation: on-target, optional gene filter, transcript-level cell concordance.
+Cloud vs On-Prem executive validation: on-target, optional gene filter, transcript-level cell concordance.
 Vectorized comparisons for large VariMAT files.
 """
 
@@ -17,6 +17,13 @@ ONTARGET_VALUE = "ONTARGET"
 
 # Cap rows stored in mismatch_df (counts remain exact); keeps UI/CSV/PDF memory bounded
 MAX_MISMATCH_ROWS = 250_000
+
+# CONCORDANCE — columns always excluded from comparison (case-insensitive)
+EXCLUDE_COLS = {"EI_TOTAL", "EI_total", "ei_total"}
+
+# CONCORDANCE — VarTk score uses tighter tolerance than the default 10%
+VARTK_COLS = {"VARTK_SCORE", "VarTk_score", "VARTK", "vartk_score"}
+VARTK_TOLERANCE_PCT = 5.0
 
 
 def detect_gene_column(df: pd.DataFrame) -> Optional[str]:
@@ -55,7 +62,7 @@ def _try_float(s: str) -> Optional[float]:
 
 
 def numeric_within_tolerance(cloud_val: Any, linc_val: Any, tolerance_pct: float) -> bool:
-    """True if both numeric and LinC within ±tolerance_pct of Cloud reference."""
+    """True if both numeric and On-Prem within ±tolerance_pct of Cloud reference."""
     _, sc = _normalize_empty(cloud_val)
     _, sl = _normalize_empty(linc_val)
     fc = _try_float(sc)
@@ -149,7 +156,7 @@ def run_pairwise_concordance(
     gene_col: Optional[str] = None,
     compare_all_genes: bool = False,
     label_cloud: str = "Cloud",
-    label_linc: str = "LinC",
+    label_linc: str = "On-Prem",
     strict_columns: Optional[list[str]] = None,
     compare_columns: Optional[list[str]] = None,
     tolerance_pct: float = 10.0,
@@ -163,7 +170,7 @@ def run_pairwise_concordance(
 
     If compare_columns is set, only those names (among shared columns) are tested — faster on large files.
 
-    Numeric tolerance: Cloud value is reference; LinC must fall within ±tolerance_pct %.
+    Numeric tolerance: Cloud value is reference; On-Prem must fall within ±tolerance_pct %.
     Strict columns: exact normalized string match only (no numeric tolerance).
     """
     out: dict[str, Any] = {
@@ -225,6 +232,10 @@ def run_pairwise_concordance(
         if gene_col:
             skip_meta.add(gene_col)
         compare_cols = [c for c in shared if c not in skip_meta]
+        # CONCORDANCE — always exclude EI_TOTAL (case-insensitive)
+        compare_cols = [c for c in compare_cols
+                        if c not in EXCLUDE_COLS
+                        and c.upper() != "EI_TOTAL"]
         if compare_columns:
             want = set(compare_columns)
             compare_cols = [c for c in compare_cols if c in want]
@@ -266,16 +277,34 @@ def run_pairwise_concordance(
         mismatch_parts: list[pd.DataFrame] = []
         n_mismatch_collected = 0
 
+        # CONCORDANCE — per-column and per-variant tracking
+        col_mismatch_counts: dict[str, int] = {}
+        col_total_tests: dict[str, int] = {}
+        col_concordance_pct: dict[str, float] = {}
+        fail_masks_per_col: list[pd.Series] = []
+        _vartk_upper = {c.upper() for c in VARTK_COLS}
+
+        # CONCORDANCE — build row-level composite key for variant tracking
+        _merged_keys_str = (
+            merged["CHROM"].astype(str) + ":"
+            + merged["START"].astype(str) + ":"
+            + merged["REF"].astype(str) + ":"
+            + merged["ALT"].astype(str) + ":"
+            + merged["ENS_TRANS_ID"].astype(str)
+        )
+
         for col in compare_cols:
             sa = merged[f"{col}_cloud"]
             sb = merged[f"{col}_linc"]
             is_strict = col in strict_set
-            # Same pass/fail rules as before: normalized strings; non-strict allows numeric band tolerance.
-            relaxed = vec_cells_equal_relaxed(sa, sb)
-            if is_strict:
-                ok = relaxed
+            # CONCORDANCE — VarTk ±5% takes priority, then strict, then default tolerance
+            is_vartk = col.upper() in _vartk_upper
+            if is_vartk:
+                ok = vec_cells_equal_relaxed(sa, sb) | vec_numeric_tol_ok(sa, sb, VARTK_TOLERANCE_PCT)
+            elif is_strict:
+                ok = vec_cells_equal_relaxed(sa, sb)
             else:
-                ok = relaxed | vec_numeric_tol_ok(sa, sb, tolerance_pct)
+                ok = vec_cells_equal_relaxed(sa, sb) | vec_numeric_tol_ok(sa, sb, tolerance_pct)
             fail = ~ok
             n_fail = int(fail.sum())
             if is_strict:
@@ -283,13 +312,18 @@ def run_pairwise_concordance(
             else:
                 n_fail_other += n_fail
 
+            # CONCORDANCE — per-column stats
+            col_mismatch_counts[col] = n_fail
+            col_total_tests[col] = n
+            col_concordance_pct[col] = round(100.0 * (n - n_fail) / n, 4) if n else 0.0
+            fail_masks_per_col.append(fail.rename(col))
+
             if n_fail > 0 and n_mismatch_collected < MAX_MISMATCH_ROWS:
                 bad = merged.loc[fail]
                 take = min(len(bad), MAX_MISMATCH_ROWS - n_mismatch_collected)
                 bad = bad.iloc[:take]
                 sub_a = bad[f"{col}_cloud"]
                 sub_b = bad[f"{col}_linc"]
-                # PERF: build mismatch rows without a Python loop over bad rows.
                 bad_keys = bad[KEY_COLS].astype(str)
                 composite = (
                     bad_keys["CHROM"]
@@ -322,6 +356,47 @@ def run_pairwise_concordance(
         out["mismatch_rows_truncated"] = n_failed > n_mismatch_collected
         if mismatch_parts:
             out["mismatch_df"] = pd.concat(mismatch_parts, ignore_index=True)
+
+        # CONCORDANCE — match_df: rows where every compared column matched perfectly
+        if fail_masks_per_col:
+            any_fail = pd.concat(fail_masks_per_col, axis=1).any(axis=1)
+        else:
+            any_fail = pd.Series(False, index=merged.index)
+        perfect_match_rows = merged[~any_fail][KEY_COLS].copy()
+        perfect_match_rows["columns_checked"] = len(compare_cols)
+        match_df = perfect_match_rows.head(MAX_MISMATCH_ROWS).reset_index(drop=True)
+
+        # CONCORDANCE — per-variant mismatch summary
+        variant_mismatch_counts: dict[str, int] = {}
+        strict_fail_variants: list[str] = []
+        if fail_masks_per_col:
+            fail_matrix = pd.concat(fail_masks_per_col, axis=1)
+            cols_failed_per_row = fail_matrix.sum(axis=1)
+            rows_with_fail = cols_failed_per_row[cols_failed_per_row > 0]
+            for idx in rows_with_fail.index:
+                vk = _merged_keys_str.iloc[idx] if idx < len(_merged_keys_str) else str(idx)
+                variant_mismatch_counts[vk] = int(rows_with_fail[idx])
+            # strict-column fail variants
+            strict_col_names = [col for col in compare_cols if col in strict_set]
+            if strict_col_names:
+                strict_fail_cols = [s for s in fail_masks_per_col if s.name in strict_set]
+                if strict_fail_cols:
+                    strict_any_fail = pd.concat(strict_fail_cols, axis=1).any(axis=1)
+                    for idx in strict_any_fail[strict_any_fail].index:
+                        vk = _merged_keys_str.iloc[idx] if idx < len(_merged_keys_str) else str(idx)
+                        strict_fail_variants.append(vk)
+
+        # CONCORDANCE — enhanced return keys
+        out["col_mismatch_counts"] = col_mismatch_counts
+        out["col_total_tests"] = col_total_tests
+        out["col_concordance_pct"] = col_concordance_pct
+        out["variant_mismatch_counts"] = variant_mismatch_counts
+        out["strict_fail_variants"] = strict_fail_variants[:1000]
+        out["match_df"] = match_df
+        out["n_perfect_match_rows"] = len(perfect_match_rows)
+        out["n_mismatch_rows"] = int(any_fail.sum())
+        out["excluded_cols"] = sorted(EXCLUDE_COLS)
+
         out["config_snapshot"] = {
             "gene": gene if not compare_all_genes else None,
             "gene_col": gene_col,
