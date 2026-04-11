@@ -284,6 +284,20 @@ def _render_executive_validation_cloud_linc(dataframes: dict) -> None:
                     )
 
 
+_QC_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qc_output")
+
+
+def _save_outputs_to_qc_output(csv_exports: dict, pdf_bytes: bytes, pdf_filename: str) -> str:
+    """Write all generated CSVs and the PDF to qc_output/. Returns the directory path."""
+    os.makedirs(_QC_OUTPUT_DIR, exist_ok=True)
+    for fname, content in (csv_exports or {}).items():
+        with open(os.path.join(_QC_OUTPUT_DIR, fname), "w", encoding="utf-8") as f:
+            f.write(content)
+    with open(os.path.join(_QC_OUTPUT_DIR, pdf_filename), "wb") as f:
+        f.write(pdf_bytes)
+    return _QC_OUTPUT_DIR
+
+
 @st_fragment
 def _render_download_buttons(
     n_files,
@@ -310,7 +324,7 @@ def _render_download_buttons(
             "qc_status": qc_status,
             "header_similarity_pct": header_result.get("header_similarity_pct", 0),
         }
-        clin_state = st.session_state.get("clinical_concordance")
+        clin_state = results.get("clinical_concordance") or st.session_state.get("clinical_concordance")
         clin_mdf = None
         if clin_state and not clin_state.get("error") and clin_state.get("mismatch_df") is not None:
             m = clin_state["mismatch_df"]
@@ -329,6 +343,8 @@ def _render_download_buttons(
         )
         for fname, content in (csv_exports or {}).items():
             st.download_button(f"Download {fname}", content, file_name=fname, mime="text/csv", key=f"csv_{fname}")
+
+        pdf_filename = get_pdf_filename()
         pdf_bytes = generate_pdf_report(
             qc_score=qc_score,
             qc_status=qc_status,
@@ -348,8 +364,15 @@ def _render_download_buttons(
             clinical_concordance=clin_state if clin_state else None,
         )
         st.download_button(
-            "Download PDF report", pdf_bytes, file_name=get_pdf_filename(), mime="application/pdf", key="pdf_dl"
+            "Download PDF report", pdf_bytes, file_name=pdf_filename, mime="application/pdf", key="pdf_dl"
         )
+
+        # Save all outputs to qc_output/ directory
+        try:
+            out_dir = _save_outputs_to_qc_output(csv_exports, pdf_bytes, pdf_filename)
+            st.caption(f"Outputs also saved to `{out_dir}/`")
+        except Exception:
+            pass
     except Exception as e:
         st.error(f"Could not generate reports: {e}")
 
@@ -438,7 +461,44 @@ def _render_qc_results_impl(results: dict) -> None:
         - **QC Score:** {qc_score}/100 ({qc_status})
         """)
 
-    _render_executive_validation_cloud_linc(dataframes)
+    # Auto-run clinical concordance (all genes) — display inline instead of manual expander
+    clin_result = results.get("clinical_concordance")
+    if clin_result and not clin_result.get("error") and clin_result.get("total_tests"):
+        st.session_state["clinical_concordance"] = clin_result
+        with st.expander("Executive validation — Cloud vs LinC (all genes, automatic)", expanded=True):
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Concordance %", f"{clin_result.get('concordance_pct', 0):.2f}")
+            with m2:
+                st.metric("Cell-level tests", f"{clin_result.get('total_tests', 0):,}")
+            with m3:
+                st.metric("Strict mismatches", clin_result.get("n_failed_strict", 0))
+            with m4:
+                st.metric("Matched rows", clin_result.get("n_rows_matched", 0))
+            st.caption(
+                f"Rows after filters — {list(dataframes.keys())[0] if dataframes else 'Cloud'}: "
+                f"{clin_result.get('n_rows_cloud_after_filters', 0):,} · "
+                f"{list(dataframes.keys())[1] if len(dataframes) > 1 else 'LinC'}: "
+                f"{clin_result.get('n_rows_linc_after_filters', 0):,} · "
+                f"Duplicates dropped: {clin_result.get('n_duplicate_rows_dropped_cloud', 0):,} / "
+                f"{clin_result.get('n_duplicate_rows_dropped_linc', 0):,}"
+            )
+            mdf = clin_result.get("mismatch_df")
+            if mdf is not None and not mdf.empty:
+                st.subheader("Mismatch detail (first 200 rows)")
+                st.dataframe(mdf.head(200), use_container_width=True, hide_index=True)
+            elif clin_result.get("n_failed", 0) == 0:
+                st.success("No cell-level mismatches in scope.")
+            if clin_result.get("mismatch_rows_truncated"):
+                st.warning("Mismatch table and CSV capped at 250,000 rows; total mismatch count in metrics is complete.")
+            for w in clin_result.get("warnings") or []:
+                st.warning(w)
+    elif clin_result and clin_result.get("error"):
+        with st.expander("Executive validation — Cloud vs LinC", expanded=False):
+            st.error(f"Clinical concordance: {clin_result['error']}")
+    else:
+        with st.expander("Executive validation — Cloud vs LinC", expanded=False):
+            st.info("Clinical concordance was not run (requires 2 files with matching columns).")
 
     tab_overview, tab_variant, tab_dup, tab_header, tab_mismatch, tab_missing, tab_reports = st.tabs([
         "Overview", "Variant comparison", "Duplicate analysis", "Header QC",
@@ -624,7 +684,6 @@ def run_full_qc(file_signatures, _dataframes_list):
         overlap_data = variant_overlap_analysis(variant_keys)
         common_ids = unique_metrics.get("common_variant_ids", set())
 
-        # Free the large sets after extraction
         import gc
 
         mismatch_result = column_mismatch_detection(dataframes, variant_keys, common_ids)
@@ -635,6 +694,38 @@ def run_full_qc(file_signatures, _dataframes_list):
         missing_data = missing_data_analysis(dataframes)
     except Exception as e:
         return {"error": str(e)}
+
+    # Auto-run clinical concordance (all genes) on the first two files
+    clinical_concordance_result = None
+    names = list(dataframes.keys())
+    if len(names) >= 2:
+        try:
+            from clinical_concordance import (
+                detect_gene_column,
+                run_pairwise_concordance,
+            )
+
+            df_cloud = dataframes[names[0]]
+            df_linc = dataframes[names[1]]
+            gene_col = detect_gene_column(df_cloud)
+            gene_col_l = detect_gene_column(df_linc)
+            if gene_col and gene_col == gene_col_l:
+                pass  # same column on both sides
+            else:
+                gene_col = None  # no gene column needed for compare_all_genes=True
+
+            clinical_concordance_result = run_pairwise_concordance(
+                df_cloud,
+                df_linc,
+                compare_all_genes=True,
+                label_cloud=names[0],
+                label_linc=names[1],
+                gene_col=gene_col,
+                tolerance_pct=10.0,
+                restrict_ontarget=True,
+            )
+        except Exception as e:
+            clinical_concordance_result = {"error": str(e), "mismatch_df": pd.DataFrame()}
 
     total_records = sum(len(df) for df in dataframes.values())
     total_unique = unique_metrics.get("total_unique_across_all", 0)
@@ -674,6 +765,7 @@ def run_full_qc(file_signatures, _dataframes_list):
         "total_unique": total_unique,
         "common_count": common_count,
         "n_files": len(dataframes),
+        "clinical_concordance": clinical_concordance_result,
     }
 
 
