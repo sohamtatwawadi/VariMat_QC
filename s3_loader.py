@@ -75,6 +75,28 @@ def get_s3_client():
     return boto3.client(**kwargs)
 
 
+def list_s3_prefixes(bucket: str, prefix: str = "") -> list[str]:
+    """
+    List immediate child “folders” under prefix (non-recursive), using Delimiter='/'.
+    Returns full prefix strings (e.g. output/run1/). On error: [] and s3_prefix_error.
+    Display stripping of the configured base prefix is done in the app.
+    """
+    st.session_state.pop("s3_prefix_error", None)
+    try:
+        client = get_s3_client()
+        paginator = client.get_paginator("list_objects_v2")
+        found: set[str] = set()
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix or "", Delimiter="/"):
+            for cp in page.get("CommonPrefixes") or []:
+                pfx = cp.get("Prefix")
+                if pfx:
+                    found.add(pfx)
+        return sorted(found)
+    except Exception as e:
+        st.session_state["s3_prefix_error"] = str(e)
+        return []
+
+
 def list_s3_files(bucket: str, prefix: str = "") -> list[dict[str, Any]]:
     """
     List objects under prefix; only .txt / .tsv / .gz; newest first.

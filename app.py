@@ -602,7 +602,7 @@ def main():
 
     local_paths = []
 
-    from s3_loader import download_s3_file, get_s3_config, list_s3_files
+    from s3_loader import download_s3_file, get_s3_config, list_s3_files, list_s3_prefixes
 
     s3_cfg = get_s3_config()
 
@@ -638,13 +638,45 @@ def main():
         else:
             st.caption(f"S3 bucket: `{s3_cfg['bucket']}` · prefix: `{s3_cfg['prefix'] or '/'}`")
 
-            if st.button("🔄 Refresh file list", key="s3_refresh"):
+            if st.button("🔄 Refresh", key="s3_refresh"):
                 st.session_state.pop("s3_file_list", None)
+                st.session_state.pop("s3_folder_list", None)
+                st.session_state.pop("s3_files_for_prefix", None)
+
+            base_prefix = s3_cfg["prefix"] or ""
+
+            if "s3_folder_list" not in st.session_state:
+                with st.spinner("Listing S3 folders…"):
+                    st.session_state["s3_folder_list"] = list_s3_prefixes(
+                        s3_cfg["bucket"], base_prefix
+                    )
+
+            folders = st.session_state.get("s3_folder_list", [])
+            pfx_err = st.session_state.pop("s3_prefix_error", None)
+            if pfx_err:
+                st.error(f"S3 folder listing failed: {pfx_err}")
+
+            if not folders:
+                selected_prefix = base_prefix
+            else:
+                display_names = [
+                    f.removeprefix(base_prefix) if base_prefix else f for f in folders
+                ]
+                chosen = st.selectbox(
+                    "Select folder",
+                    options=display_names,
+                    key="s3_folder_sel",
+                )
+                selected_prefix = folders[display_names.index(chosen)]
+
+            if st.session_state.get("s3_files_for_prefix") != selected_prefix:
+                st.session_state.pop("s3_file_list", None)
+                st.session_state["s3_files_for_prefix"] = selected_prefix
 
             if "s3_file_list" not in st.session_state:
                 with st.spinner("Listing S3 files…"):
                     st.session_state["s3_file_list"] = list_s3_files(
-                        s3_cfg["bucket"], s3_cfg["prefix"]
+                        s3_cfg["bucket"], selected_prefix
                     )
 
             s3_files = st.session_state.get("s3_file_list", [])
@@ -652,8 +684,12 @@ def main():
             if err:
                 st.error(f"S3 listing failed: {err}")
 
-            if not s3_files:
-                st.info("No .txt / .tsv / .gz files found in the configured bucket/prefix.")
+            if not folders and not s3_files:
+                st.warning("No files or folders found under the configured prefix.")
+            elif not s3_files:
+                st.info(
+                    "No .txt / .tsv / .gz files in this folder. Pick another folder or adjust **S3_PREFIX**."
+                )
             else:
                 file_df = pd.DataFrame(s3_files)[["key", "size_mb", "last_modified"]]
                 file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
