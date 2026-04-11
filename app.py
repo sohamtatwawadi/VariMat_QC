@@ -638,8 +638,23 @@ def main():
         else:
             # MIXED-SOURCE: combined S3 + browser upload in one expander
             with st.expander("☁️ Load files — S3 + optional browser upload", expanded=True):
+                # MIXED-SOURCE — Uploader first at top of expander so widget state is stable (not after long S3 folder branches)
+                st.markdown("#### Step 1 — Optional: upload files from your computer")
+                st.caption("Use this to compare an S3 file against a local file not yet in S3.")
+                _n_s3_prev = len(st.session_state.get("s3_selected_keys") or [])
+                _max_upload_prev = max(1, 10 - _n_s3_prev)
+                uploaded_mixed = st.file_uploader(
+                    f"Upload up to {_max_upload_prev} additional file(s)",
+                    type=["txt", "tsv", "gz"],
+                    accept_multiple_files=True,
+                    key="s3_mixed_uploader",
+                    help="These are combined with the S3 files you select in Step 2.",
+                )
+
+                st.divider()
+
                 # MIXED-SOURCE — Section A: S3 folder + file picker (0–9 S3 objects)
-                st.markdown("#### Step 1 — Pick files from S3")
+                st.markdown("#### Step 2 — Pick files from S3")
                 base_prefix = s3_cfg["prefix"] or ""
                 st.caption(f"Bucket: `{s3_cfg['bucket']}`  Prefix: `{base_prefix or '/'}`")
 
@@ -711,32 +726,24 @@ def main():
                     )
                     s3_selected_keys = list(s3_selected_keys or [])[:9]
 
-                st.divider()
-
-                # MIXED-SOURCE — Section B: browser upload (combined with S3, max 10 total)
-                st.markdown("#### Step 2 — Optional: also upload files from your computer")
-                st.caption("Use this to compare an S3 file against a local file not yet in S3.")
-
-                max_upload = max(1, 10 - len(s3_selected_keys))
-                uploaded_mixed = st.file_uploader(
-                    f"Upload up to {max_upload} additional file(s)",
-                    type=["txt", "tsv", "gz"],
-                    accept_multiple_files=True,
-                    key="s3_mixed_uploader",
-                    help="These are combined with the S3 files selected above.",
-                )
+                max_upload = max(1, 10 - (len(s3_selected_keys) if s3_selected_keys else 0))
                 um_list = list(uploaded_mixed or [])
                 if len(um_list) > max_upload:
                     st.warning(
-                        f"Max {max_upload} uploads allowed when {len(s3_selected_keys)} S3 file(s) selected. "
+                        f"Max {max_upload} uploads allowed when "
+                        f"{len(s3_selected_keys) if s3_selected_keys else 0} S3 file(s) selected. "
                         f"Only first {max_upload} used."
                     )
                     um_list = um_list[:max_upload]
 
-                total_selected = len(s3_selected_keys) + len(um_list)
-
-                if total_selected < 2:
-                    st.info(f"👆 Select at least 2 files total. Currently: {total_selected} selected.")
+                n_s3_btn = len(s3_selected_keys) if s3_selected_keys else 0
+                n_up_btn = len(uploaded_mixed) if uploaded_mixed else 0
+                total_btn = n_s3_btn + n_up_btn
+                if total_btn < 2:
+                    st.info(
+                        f"👆 Select at least 2 files total. Currently: {total_btn} selected "
+                        f"({n_s3_btn} from S3, {n_up_btn} uploaded)."
+                    )
 
                 st.divider()
 
@@ -761,15 +768,20 @@ def main():
                         size_mb = nbytes / (1024 * 1024)
                         st.caption(f"  💻 {f.name}  ({size_mb:.0f} MB)")
 
+                # Re-evaluate counts immediately before the button so Streamlit has the latest uploader state
+                n_s3_btn = len(s3_selected_keys) if s3_selected_keys else 0
+                n_up_btn = len(uploaded_mixed) if uploaded_mixed else 0
+                total_btn = n_s3_btn + n_up_btn
+
                 load_btn = st.button(
                     "🚀 Load & Compare",
                     type="primary",
                     key="s3_mixed_load_btn",
-                    disabled=total_selected < 2,
+                    disabled=total_btn < 2,
                 )
 
                 # MIXED-SOURCE — persist combined paths; uploads written as real files for parquet sidecars
-                if load_btn and total_selected >= 2:
+                if load_btn and total_btn >= 2:
                     combined_local_paths: list[str] = []
                     load_errors: list[str] = []
                     tmp_root = os.environ.get("TMPDIR", "/tmp")
