@@ -802,12 +802,19 @@ def main():
                     if um_list:
                         up_status = st.empty()
                         for f in um_list:
+                            up_status.text(f"Saving uploaded file: {f.name}…")
+                            tmp_path = os.path.join(tmp_root, f.name)
                             try:
-                                up_status.text(f"Saving uploaded file: {f.name}…")
-                                tmp_path = os.path.join(tmp_root, f.name)
                                 f.seek(0)
+                                raw = f.read()
+                                if not raw:
+                                    load_errors.append(f"Upload {f.name}: file is empty")
+                                    continue
                                 with open(tmp_path, "wb") as out:
-                                    out.write(f.read())
+                                    out.write(raw)
+                                if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+                                    load_errors.append(f"Upload {f.name}: failed to write to /tmp")
+                                    continue
                                 combined_local_paths.append(tmp_path)
                             except Exception as e:
                                 load_errors.append(f"Upload {f.name}: {e}")
@@ -879,12 +886,12 @@ def main():
             errors = []
             seen_names = {}
             ordered_success = []
-            max_workers = min(len(local_paths), 4)
+            max_workers = min(len(local_paths), 2)
             progress_bar = st.progress(0)
-            st.caption("Loading from disk (process pool for CPU-bound parsing)…")
+            st.caption("Loading from disk (thread pool; Polars releases GIL during I/O)…")
             with st.spinner("Reading files from disk (no upload)…"):
-                # Process pool: CPU-bound TSV parse parallelizes across cores; worker is in utils so spawn can pickle it.
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Thread pool: avoids process spawn OOM on small Railway containers; cap workers for memory.
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = [executor.submit(load_varimat_path_worker, (i, p)) for i, p in enumerate(local_paths)]
                     results = []
                     n_paths = len(local_paths)

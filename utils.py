@@ -5,6 +5,7 @@ Supports .txt, .tsv, .txt.gz with efficient parsing for large files.
 
 from __future__ import annotations
 
+import gc
 import gzip
 import io
 import os
@@ -182,7 +183,11 @@ def safe_load_varimat_from_path(path: str, nrows: Optional[int] = None) -> tuple
                 pl_df = _strip_polars_column_names(pl_df)
                 df = _pl_to_pandas(pl_df)
                 if not df.empty and all(c in df.columns for c in REQUIRED_COLS):
+                    del pl_df
+                    gc.collect()
                     return df, None
+                del pl_df
+                gc.collect()
         except Exception:
             pass
 
@@ -194,9 +199,13 @@ def safe_load_varimat_from_path(path: str, nrows: Optional[int] = None) -> tuple
         return None, str(e)
 
     if df.empty:
+        del pl_df
+        gc.collect()
         return None, "File is empty."
     for col in REQUIRED_COLS:
         if col not in df.columns:
+            del pl_df
+            gc.collect()
             return None, f"Missing required column: {col}. Found: {list(df.columns)[:20]}..."
 
     if nrows is None:
@@ -206,22 +215,31 @@ def safe_load_varimat_from_path(path: str, nrows: Optional[int] = None) -> tuple
         except Exception:
             pass
 
+    del pl_df
+    gc.collect()
     return df, None
 
 
 def load_varimat_path_worker(args: Tuple[int, str]) -> Tuple[int, str, str, Optional[pd.DataFrame], Optional[str], float]:
     """
-    ProcessPoolExecutor entry point: parsing is CPU-bound under the GIL.
-    Defined in this module (not app/__main__) so multiprocessing “spawn” can pickle the target.
+    Thread/process pool entry point for path-based loads.
+    Defined in this module so multiprocessing “spawn” can pickle the target if needed.
     """
     order, path = args
     path = os.path.expanduser(str(path).strip())
-    size_mb = 0.0
-    if path and os.path.isfile(path):
-        try:
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-        except OSError:
-            pass
+    if not path or not os.path.isfile(path):
+        return (
+            order,
+            path,
+            os.path.basename(path) or "unknown",
+            None,
+            f"File not found: {path}",
+            0.0,
+        )
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
     df, err = safe_load_varimat_from_path(path)
-    name = os.path.basename(path) if path else "unknown"
+    name = os.path.basename(path)
     return (order, path, name, df, err, size_mb)
