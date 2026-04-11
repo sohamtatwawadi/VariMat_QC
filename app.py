@@ -616,6 +616,10 @@ def main():
     }
     _method_options = [_METHOD_S3, _METHOD_UPLOAD, _METHOD_PATHS]
 
+    # Default to upload method if no previous selection stored
+    if "file_load_method" not in st.session_state:
+        st.session_state["file_load_method"] = _METHOD_UPLOAD
+
     load_method = st.radio(
         "Choose how to load files",
         options=_method_options,
@@ -623,6 +627,21 @@ def main():
         horizontal=True,
         key="file_load_method",
     )
+
+    # When method changes, clear all cross-method session state to avoid
+    # stale state from previous method bleeding into the new one
+    _prev_method = st.session_state.get("_prev_load_method")
+    if _prev_method and _prev_method != load_method:
+        for _k in [
+            "s3_resolved_paths",
+            "s3_folder_list",
+            "s3_file_list",
+            "s3_last_prefix",
+            "s3_selected_keys",
+            "clinical_concordance",
+        ]:
+            st.session_state.pop(_k, None)
+    st.session_state["_prev_load_method"] = load_method
 
     path_input = ""
     use_paths = False
@@ -990,9 +1009,10 @@ def main():
         st.info("Enter **local server paths** (one per line) and click **Load from paths**.")
         return
     elif load_method == _METHOD_S3:
-        if s3_cfg:
-            st.info("Select files from the S3 list and click **Load selected files from S3**.")
-        return
+        if "s3_resolved_paths" not in st.session_state:
+            if s3_cfg:
+                st.info("Select files from the S3 list and click **Load selected files from S3**.")
+            return
     else:
         return
 
