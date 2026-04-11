@@ -602,7 +602,7 @@ def main():
 
     local_paths = []
 
-    from s3_loader import download_s3_file, get_s3_config, list_s3_files, list_s3_prefixes
+    from s3_loader import download_s3_file, get_s3_config, list_s3_files, list_varimat_folders
 
     s3_cfg = get_s3_config()
 
@@ -636,113 +636,194 @@ def main():
                 "Restart Streamlit after changing them."
             )
         else:
-            st.caption(f"S3 bucket: `{s3_cfg['bucket']}` · prefix: `{s3_cfg['prefix'] or '/'}`")
+            # MIXED-SOURCE: combined S3 + browser upload in one expander
+            with st.expander("☁️ Load files — S3 + optional browser upload", expanded=True):
+                # MIXED-SOURCE — Section A: S3 folder + file picker (0–9 S3 objects)
+                st.markdown("#### Step 1 — Pick files from S3")
+                base_prefix = s3_cfg["prefix"] or ""
+                st.caption(f"Bucket: `{s3_cfg['bucket']}`  Prefix: `{base_prefix or '/'}`")
 
-            if st.button("🔄 Refresh", key="s3_refresh"):
-                st.session_state.pop("s3_file_list", None)
-                st.session_state.pop("s3_folder_list", None)
-                st.session_state.pop("s3_files_for_prefix", None)
+                _, col_btn = st.columns([6, 1])
+                with col_btn:
+                    if st.button("🔄 Refresh", key="s3_refresh"):
+                        for k in ("s3_folder_list", "s3_file_list", "s3_last_prefix", "s3_files_for_prefix"):
+                            st.session_state.pop(k, None)
+                        st.rerun()
 
-            base_prefix = s3_cfg["prefix"] or ""
+                if "s3_folder_list" not in st.session_state:
+                    with st.spinner("Scanning S3 folders (up to 5 levels)…"):
+                        st.session_state["s3_folder_list"] = list_varimat_folders(
+                            s3_cfg["bucket"], base_prefix, max_depth=5
+                        )
 
-            if "s3_folder_list" not in st.session_state:
-                with st.spinner("Listing S3 folders…"):
-                    st.session_state["s3_folder_list"] = list_s3_prefixes(
-                        s3_cfg["bucket"], base_prefix
+                err = st.session_state.pop("s3_prefix_error", None)
+                if err:
+                    st.error(f"S3 folder scan failed: {err}")
+
+                folders = st.session_state.get("s3_folder_list", [])
+                chosen_display = base_prefix or "/"
+                s3_selected_keys: list[str] = []
+
+                if not folders:
+                    st.info("No folders found — listing files directly under prefix.")
+                    selected_prefix = base_prefix
+                else:
+                    folder_display_names = [
+                        (f.removeprefix(base_prefix) if base_prefix else f).rstrip("/") or f.rstrip("/")
+                        for f in folders
+                    ]
+                    chosen_display = st.selectbox(
+                        "Run folder",
+                        folder_display_names,
+                        key="s3_folder_sel",
+                        help="Scanned up to 5 levels deep; shows folders named 'varimat' first.",
                     )
+                    selected_prefix = folders[folder_display_names.index(chosen_display)]
 
-            folders = st.session_state.get("s3_folder_list", [])
-            pfx_err = st.session_state.pop("s3_prefix_error", None)
-            if pfx_err:
-                st.error(f"S3 folder listing failed: {pfx_err}")
+                if st.session_state.get("s3_last_prefix") != selected_prefix:
+                    st.session_state.pop("s3_file_list", None)
+                    st.session_state["s3_last_prefix"] = selected_prefix
 
-            if not folders:
-                selected_prefix = base_prefix
-            else:
-                display_names = [
-                    f.removeprefix(base_prefix) if base_prefix else f for f in folders
-                ]
-                chosen = st.selectbox(
-                    "Select folder",
-                    options=display_names,
-                    key="s3_folder_sel",
-                )
-                selected_prefix = folders[display_names.index(chosen)]
+                if "s3_file_list" not in st.session_state:
+                    with st.spinner(f"Listing files in `{chosen_display}`…"):
+                        st.session_state["s3_file_list"] = list_s3_files(
+                            s3_cfg["bucket"], selected_prefix
+                        )
 
-            if st.session_state.get("s3_files_for_prefix") != selected_prefix:
-                st.session_state.pop("s3_file_list", None)
-                st.session_state["s3_files_for_prefix"] = selected_prefix
+                files_for_select = st.session_state.get("s3_file_list", [])
 
-            if "s3_file_list" not in st.session_state:
-                with st.spinner("Listing S3 files…"):
-                    st.session_state["s3_file_list"] = list_s3_files(
-                        s3_cfg["bucket"], selected_prefix
+                if not folders and not files_for_select:
+                    st.warning("No files or folders found under the configured prefix.")
+                elif not files_for_select:
+                    st.info("No .txt / .tsv / .gz files in this folder.")
+                else:
+                    file_df = pd.DataFrame(files_for_select)[["key", "size_mb", "last_modified"]]
+                    file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
+                    st.dataframe(file_df, use_container_width=True, hide_index=True)
+
+                    s3_options = [f["key"] for f in files_for_select]
+                    s3_selected_keys = st.multiselect(
+                        "Select files from S3 (optional — can mix with uploaded files below)",
+                        options=s3_options,
+                        max_selections=9,
+                        key="s3_selected_keys",
+                        help="You can select 0 files here and use only browser upload, or mix both.",
                     )
+                    s3_selected_keys = list(s3_selected_keys or [])[:9]
 
-            s3_files = st.session_state.get("s3_file_list", [])
-            err = st.session_state.pop("s3_list_error", None)
-            if err:
-                st.error(f"S3 listing failed: {err}")
+                st.divider()
 
-            if not folders and not s3_files:
-                st.warning("No files or folders found under the configured prefix.")
-            elif not s3_files:
-                st.info(
-                    "No .txt / .tsv / .gz files in this folder. Pick another folder or adjust **S3_PREFIX**."
+                # MIXED-SOURCE — Section B: browser upload (combined with S3, max 10 total)
+                st.markdown("#### Step 2 — Optional: also upload files from your computer")
+                st.caption("Use this to compare an S3 file against a local file not yet in S3.")
+
+                max_upload = max(1, 10 - len(s3_selected_keys))
+                uploaded_mixed = st.file_uploader(
+                    f"Upload up to {max_upload} additional file(s)",
+                    type=["txt", "tsv", "gz"],
+                    accept_multiple_files=True,
+                    key="s3_mixed_uploader",
+                    help="These are combined with the S3 files selected above.",
                 )
-            else:
-                file_df = pd.DataFrame(s3_files)[["key", "size_mb", "last_modified"]]
-                file_df.columns = ["S3 Key", "Size (MB)", "Last Modified"]
-                st.dataframe(file_df, use_container_width=True, hide_index=True)
+                um_list = list(uploaded_mixed or [])
+                if len(um_list) > max_upload:
+                    st.warning(
+                        f"Max {max_upload} uploads allowed when {len(s3_selected_keys)} S3 file(s) selected. "
+                        f"Only first {max_upload} used."
+                    )
+                    um_list = um_list[:max_upload]
 
-                options = [f["key"] for f in s3_files]
-                selected_keys = st.multiselect(
-                    "Select 2–10 files to compare",
-                    options=options,
-                    key="s3_selected_keys",
-                    help="Files download to the server (/tmp) — no browser upload. Choose at most 10.",
-                )
+                total_selected = len(s3_selected_keys) + len(um_list)
 
-                use_s3 = st.button(
-                    "Load selected files from S3",
+                if total_selected < 2:
+                    st.info(f"👆 Select at least 2 files total. Currently: {total_selected} selected.")
+
+                st.divider()
+
+                # MIXED-SOURCE — Section C: Load & Compare → /tmp paths + existing local pipeline
+                st.markdown("#### Step 3 — Load & Compare")
+
+                if s3_selected_keys:
+                    st.markdown("**From S3:**")
+                    for k in s3_selected_keys:
+                        fname = k.split("/")[-1]
+                        size_mb = next(
+                            (float(f["size_mb"]) for f in files_for_select if f["key"] == k),
+                            0.0,
+                        )
+                        st.caption(f"  ☁️ {fname}  ({size_mb:.0f} MB)")
+                if um_list:
+                    st.markdown("**From browser:**")
+                    for f in um_list:
+                        nbytes = getattr(f, "size", None) or 0
+                        if not nbytes and hasattr(f, "getvalue"):
+                            nbytes = len(f.getvalue())
+                        size_mb = nbytes / (1024 * 1024)
+                        st.caption(f"  💻 {f.name}  ({size_mb:.0f} MB)")
+
+                load_btn = st.button(
+                    "🚀 Load & Compare",
                     type="primary",
-                    key="s3_load_btn",
-                    disabled=len(selected_keys) < 2,
+                    key="s3_mixed_load_btn",
+                    disabled=total_selected < 2,
                 )
 
-                if use_s3 and len(selected_keys) >= 2:
-                    selected_keys = selected_keys[:10]
-                    s3_local_paths = []
-                    dl_errors = []
-                    dl_progress = st.progress(0)
-                    dl_status = st.empty()
-                    for i, key in enumerate(selected_keys):
-                        fname = key.split("/")[-1]
-                        dl_status.text(f"Downloading {fname} ({i + 1}/{len(selected_keys)})…")
-                        file_bar = st.progress(0)
-                        try:
-                            local_path = download_s3_file(
-                                s3_cfg["bucket"], key, file_progress=file_bar
-                            )
-                            s3_local_paths.append(local_path)
-                        except Exception as e:
-                            dl_errors.append(f"{fname}: {e}")
-                        dl_progress.progress((i + 1) / len(selected_keys))
-                    try:
-                        dl_progress.empty()
-                    except Exception:
-                        pass
-                    try:
-                        dl_status.empty()
-                    except Exception:
-                        pass
+                # MIXED-SOURCE — persist combined paths; uploads written as real files for parquet sidecars
+                if load_btn and total_selected >= 2:
+                    combined_local_paths: list[str] = []
+                    load_errors: list[str] = []
+                    tmp_root = os.environ.get("TMPDIR", "/tmp")
 
-                    for msg in dl_errors:
+                    if s3_selected_keys:
+                        dl_progress = st.progress(0)
+                        dl_status = st.empty()
+                        n_s3 = len(s3_selected_keys)
+                        for i, key in enumerate(s3_selected_keys):
+                            fname = key.split("/")[-1]
+                            dl_status.text(f"Downloading from S3: {fname} ({i + 1}/{n_s3})…")
+                            file_bar = st.progress(0)
+                            try:
+                                local_path = download_s3_file(
+                                    s3_cfg["bucket"], key, file_progress=file_bar
+                                )
+                                combined_local_paths.append(local_path)
+                            except Exception as e:
+                                load_errors.append(f"S3 {fname}: {e}")
+                            dl_progress.progress((i + 1) / n_s3)
+                        try:
+                            dl_progress.empty()
+                        except Exception:
+                            pass
+                        try:
+                            dl_status.empty()
+                        except Exception:
+                            pass
+
+                    if um_list:
+                        up_status = st.empty()
+                        for f in um_list:
+                            try:
+                                up_status.text(f"Saving uploaded file: {f.name}…")
+                                tmp_path = os.path.join(tmp_root, f.name)
+                                f.seek(0)
+                                with open(tmp_path, "wb") as out:
+                                    out.write(f.read())
+                                combined_local_paths.append(tmp_path)
+                            except Exception as e:
+                                load_errors.append(f"Upload {f.name}: {e}")
+                        try:
+                            up_status.empty()
+                        except Exception:
+                            pass
+
+                    for msg in load_errors:
                         st.error(msg)
 
-                    if len(s3_local_paths) >= 2:
-                        st.session_state["s3_resolved_paths"] = s3_local_paths
+                    if len(combined_local_paths) >= 2:
+                        st.session_state["s3_resolved_paths"] = combined_local_paths
                         st.rerun()
+                    else:
+                        st.error("Not enough files loaded successfully (need at least 2).")
 
     elif load_method == _METHOD_UPLOAD:
         st.caption("Upload from your computer (browser). For large files on the same machine as the server, use **Local paths** instead.")

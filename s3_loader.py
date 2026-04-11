@@ -75,23 +75,49 @@ def get_s3_client():
     return boto3.client(**kwargs)
 
 
-def list_s3_prefixes(bucket: str, prefix: str = "") -> list[str]:
+def list_varimat_folders(bucket: str, prefix: str, max_depth: int = 5) -> list[str]:
     """
-    List immediate child “folders” under prefix (non-recursive), using Delimiter='/'.
-    Returns full prefix strings (e.g. output/run1/). On error: [] and s3_prefix_error.
-    Display stripping of the configured base prefix is done in the app.
+    Walk up to max_depth levels under prefix using Delimiter pagination.
+    Return all prefixes whose last path component is "varimat".
+    If none found, return leaf-level prefixes from the deepest non-empty BFS level.
     """
     st.session_state.pop("s3_prefix_error", None)
     try:
         client = get_s3_client()
         paginator = client.get_paginator("list_objects_v2")
-        found: set[str] = set()
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix or "", Delimiter="/"):
-            for cp in page.get("CommonPrefixes") or []:
-                pfx = cp.get("Prefix")
-                if pfx:
-                    found.add(pfx)
-        return sorted(found)
+
+        def get_subprefixes(p: str) -> list[str]:
+            result: list[str] = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=p, Delimiter="/"):
+                for cp in page.get("CommonPrefixes") or []:
+                    pfx = cp.get("Prefix")
+                    if pfx:
+                        result.append(pfx)
+            return result
+
+        current_level = [prefix or ""]
+        varimat_found: list[str] = []
+        last_nonempty: list[str] = []
+
+        for _depth in range(max_depth):
+            next_level: list[str] = []
+            for p in current_level:
+                children = get_subprefixes(p)
+                if children:
+                    next_level.extend(children)
+                    for c in children:
+                        name = c.rstrip("/").split("/")[-1]
+                        if name.lower() == "varimat":
+                            varimat_found.append(c)
+            current_level = next_level
+            if current_level:
+                last_nonempty = list(current_level)
+            if not current_level:
+                break
+
+        if varimat_found:
+            return sorted(set(varimat_found))
+        return sorted(set(last_nonempty)) if last_nonempty else []
     except Exception as e:
         st.session_state["s3_prefix_error"] = str(e)
         return []
