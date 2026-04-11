@@ -3,9 +3,8 @@ VariMAT QC Dashboard - Production-ready QC tool for genomics variant files.
 Upload multiple VariMAT files, run QC, compare variants, and download reports.
 """
 
-import io
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -26,7 +25,7 @@ from qc_engine import (
     column_mismatch_detection,
 )
 from report_generator import generate_csv_exports, generate_pdf_report, get_pdf_filename
-from utils import create_variant_key, load_varimat_path_worker, safe_load_varimat
+from utils import create_variant_key, load_varimat_path_worker
 
 # Page config
 st.set_page_config(
@@ -1012,6 +1011,62 @@ def main():
         if not uploaded:
             st.info("👆 Use **Browse files** or drag & drop at least 2 VariMAT files.")
             return
+
+        if len(uploaded) < 2:
+            st.warning("Please upload at least 2 files for comparison.")
+            return
+        if len(uploaded) > 10:
+            st.warning("Maximum 10 files allowed. Only the first 10 will be used.")
+            uploaded = uploaded[:10]
+
+        # Write uploads to /tmp one at a time (sequential) to avoid
+        # holding multiple decompressed files in RAM simultaneously.
+        # Then hand off to the local path pipeline (parquet cache + polars).
+        tmp_root = os.environ.get("TMPDIR", "/tmp")
+        tmp_paths = []
+        write_errors = []
+
+        write_bar = st.progress(0)
+        write_status = st.empty()
+        n_files = len(uploaded)
+
+        for i, f in enumerate(uploaded):
+            write_status.text(f"Saving {f.name} to server ({i + 1}/{n_files})…")
+            tmp_path = os.path.join(tmp_root, f.name)
+            try:
+                f.seek(0)
+                # Stream write in 64 MB chunks — never holds full file in RAM
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        chunk = f.read(64 * 1024 * 1024)  # 64 MB chunks
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    write_errors.append(f"{f.name}: failed to write to /tmp")
+                else:
+                    tmp_paths.append(tmp_path)
+            except Exception as e:
+                write_errors.append(f"{f.name}: {e}")
+            write_bar.progress((i + 1) / n_files)
+
+        try:
+            write_bar.empty()
+            write_status.empty()
+        except Exception:
+            pass
+
+        for msg in write_errors:
+            st.error(msg)
+
+        if len(tmp_paths) < 2:
+            st.error("Not enough files saved successfully (need at least 2).")
+            return
+
+        # Hand off to local path pipeline — identical to S3 download path
+        st.session_state["s3_resolved_paths"] = tmp_paths
+        st.rerun()
+
     elif load_method == _METHOD_PATHS:
         st.info("Enter **local server paths** (one per line) and click **Load from paths**.")
         return
@@ -1022,121 +1077,6 @@ def main():
             return
     else:
         return
-
-    if len(uploaded) < 2:
-        st.warning("Please upload at least 2 files for comparison.")
-        return
-    if len(uploaded) > 10:
-        st.warning("Maximum 10 files allowed. Only the first 10 will be used.")
-        uploaded = uploaded[:10]
-
-    # Load uploaded files in parallel (single read per file + parallel parse)
-    def load_one_file(args):
-        f, order = args
-        raw = b""
-        try:
-            f.seek(0)
-            raw = f.read()
-            size_mb = len(raw) / (1024 * 1024)
-            byte_size = len(raw)
-            df, err = safe_load_varimat(io.BytesIO(raw), f.name)
-            return (order, f.name, df, err, size_mb, byte_size)
-        except Exception as e:
-            size_mb = len(raw) / (1024 * 1024) if raw else 0.0
-            return (order, getattr(f, "name", "unknown"), None, str(e), size_mb, len(raw))
-
-    file_info = []
-    dataframes = {}
-    errors = []
-    seen_names = {}
-    upload_order = []
-    max_workers = min(len(uploaded), 4)
-    n_uploaded = len(uploaded)
-    st.caption(
-        "**Upload vs parse:** The file picker shows each file while it is **sent from your browser**. "
-        "Streamlit does not expose a byte-level progress bar for that step. "
-        "The bar below tracks **server-side parsing** (read buffer + Polars) after each file arrives — "
-        "this is usually what you see stuck on deploy for large files."
-    )
-    parse_bar = st.progress(0)
-    parse_line = st.empty()
-    parse_line.markdown(f"**Server parse:** starting **0 / {n_uploaded}** files…")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(load_one_file, (f, i)) for i, f in enumerate(uploaded)]
-        results = []
-        for k, future in enumerate(as_completed(futures), start=1):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                results.append((9999, "unknown", None, str(e), 0.0, 0))
-            parse_bar.progress(min(k / n_uploaded, 1.0))
-            parse_line.markdown(f"**Server parse:** finished **{k} / {n_uploaded}** file(s)…")
-
-    try:
-        parse_bar.empty()
-        parse_line.empty()
-    except Exception:
-        pass
-
-    results.sort(key=lambda x: int(x[0]) if x[0] is not None else 9999)
-    for _ord, name, df, err, size_mb, byte_size in results:
-        display_name = name or "unknown"
-        if name in seen_names:
-            seen_names[name] += 1
-            display_name = f"{name} ({seen_names[name]})"
-        else:
-            seen_names[name] = 1
-        if err or df is None:
-            errors.append((display_name, err or "Load failed"))
-            file_info.append({"File": display_name, "Records": "—", "Status": "❌ Error", "Size (MB)": f"{size_mb:.2f}"})
-        else:
-            dataframes[display_name] = df
-            upload_order.append((name, int(byte_size), display_name, df))
-            file_info.append({
-                "File": display_name,
-                "Records": f"{len(df):,}",
-                "Status": "✅ OK",
-                "Size (MB)": f"{size_mb:.2f}",
-            })
-
-    st.subheader("Upload status")
-    if file_info:
-        st.dataframe(pd.DataFrame(file_info), use_container_width=True, hide_index=True)
-    for name, msg in errors:
-        st.error(f"**{name}**: {msg}")
-
-    if len(dataframes) == 0 and errors:
-        st.error("No files could be loaded. Check file format (required columns: CHROM, START, REF, ALT).")
-        st.stop()
-
-    if len(dataframes) < 2:
-        st.warning("At least 2 files must load successfully for comparison. Upload or fix the failed files.")
-        st.stop()
-
-    try:
-        if len(upload_order) < 2:
-            st.error("Need at least 2 valid files to run QC.")
-            return
-        file_signatures = tuple((n, b) for n, b, _, _ in upload_order)
-        dataframes_list = tuple((dn, d) for _, _, dn, d in upload_order)
-        with st.spinner("Running full QC (overlap, mismatches, score — large files can take several minutes)…"):
-            results = run_full_qc(file_signatures, _dataframes_list=dataframes_list)
-    except Exception as e:
-        st.error(f"QC failed: {e}")
-        return
-
-    if results is None:
-        st.error("QC could not run (e.g. missing required columns).")
-        return
-    if results.get("error"):
-        st.error(results["error"])
-        return
-
-    try:
-        _render_qc_results(results)
-    except Exception as e:
-        st.error(f"Could not display results: {e}")
 
 
 if __name__ == "__main__":
